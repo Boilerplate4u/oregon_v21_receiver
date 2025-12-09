@@ -1,0 +1,9 @@
+# esphome/components/oregon_v21_receiver/manifest.yaml
+
+version: 1.0.0
+type: custom_component
+documentation: https://github.com/Boilerplate4U/oregon_v21_receiver
+author: "@Boilerplate4U"
+dependencies:
+  - remote_receiver
+requirements: []
