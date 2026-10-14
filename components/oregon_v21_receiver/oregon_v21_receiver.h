@@ -1,67 +1,64 @@
-// esphome/components/oregon_v21_receiver/oregon_v21_receiver.h
-
 #pragma once
 
-#include "esphome/core/component.h"
-#include "esphome/components/remote_receiver/remote_receiver.h"
-#include "esphome/components/sensor/sensor.h"
 #include <vector>
-#include <cmath>
+
+#include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/remote_base/remote_base.h"
+#include "esphome/components/sensor/sensor.h"
+#include "esphome/core/component.h"
+
+#include "manchester_decoder.h"
+#include "oregon_protocol.h"
 
 namespace esphome {
 namespace oregon_v21_receiver {
 
-using remote_receiver::RemoteReceiveData;
-
-class OregonV21Receiver : public Component, public remote_receiver::RemoteReceiverListener {
+/// One configured Oregon sensor, matched on channel and optionally rolling code.
+class OregonDevice {
  public:
-  // Sensor pointers - will be created and registered via Python code
-  sensor::Sensor *temperature_sensor{nullptr};
-  sensor::Sensor *humidity_sensor{nullptr};
-  sensor::Sensor *battery_sensor{nullptr};
-
-  // Setters for remote receiver
-  void set_remote_receiver(remote_receiver::RemoteReceiverBase *rx) {
-    this->remote_rx_ = rx;
-    if (rx != nullptr) {
-      rx->add_listener(this);
-    }
+  void set_channel(uint8_t channel) { this->channel_ = channel; }
+  void set_rolling_code(uint8_t rolling_code) {
+    this->rolling_code_ = rolling_code;
+    this->match_rolling_code_ = true;
   }
+  void set_temperature_sensor(sensor::Sensor *s) { this->temperature_sensor_ = s; }
+  void set_humidity_sensor(sensor::Sensor *s) { this->humidity_sensor_ = s; }
+  void set_battery_low_binary_sensor(binary_sensor::BinarySensor *s) { this->battery_low_binary_sensor_ = s; }
 
-  void setup() override { ESP_LOGI("oregon", "Oregon v2.1 Receiver initialized"); }
-  void loop() override {}
-
-  // Called when remote_receiver has data
-  void on_receive(const RemoteReceiveData &data) override;
+  bool matches(const OregonReading &reading) const;
+  void publish(const OregonReading &reading);
+  void dump_config(const char *tag) const;
 
  protected:
-  remote_receiver::RemoteReceiverBase *remote_rx_{nullptr};
+  uint8_t channel_{0};
+  uint8_t rolling_code_{0};
+  bool match_rolling_code_{false};
+  sensor::Sensor *temperature_sensor_{nullptr};
+  sensor::Sensor *humidity_sensor_{nullptr};
+  binary_sensor::BinarySensor *battery_low_binary_sensor_{nullptr};
+};
 
-  // Decoding state
-  std::vector<int32_t> raw_data_;
-  std::vector<uint8_t> bits_;
+/// Listens to a remote_receiver and decodes Oregon Scientific v2.1 messages.
+class OregonV21Receiver : public Component, public remote_base::RemoteReceiverListener {
+ public:
+  void add_device(OregonDevice *device) { this->devices_.push_back(device); }
+  void set_timing(const ManchesterDecoder::Timing &timing) { this->decoder_.set_timing(timing); }
 
-  // Decoded values
-  float decoded_temp_{0.0f};
-  float decoded_hum_{0.0f};
-  float decoded_batt_{0.0f};
+  bool on_receive(remote_base::RemoteReceiveData data) override;
+  void dump_config() override;
+  float get_setup_priority() const override { return setup_priority::DATA; }
 
-  // Thresholds
-  static constexpr int MIN_PULSES = 100;
-  static constexpr int MAX_PULSES = 400;
-  static constexpr float BASE_US = 1000.0f;
-  static constexpr float MANCHESTER_MIN = 0.75f;
-  static constexpr float MANCHESTER_MAX = 1.25f;
-  static constexpr int MANCHESTER_QUALITY_THRESHOLD = 50;
+ protected:
+  bool handle_message_();
+  bool is_repeat_(const uint8_t *data, size_t len);
 
-  // Core algorithm
-  bool decode_frame_();
-  bool extract_bits_manchester_();
-  bool find_sync_and_extract_payload_(std::vector<uint8_t> &payload);
-  bool decode_payload_(const std::vector<uint8_t> &payload);
+  ManchesterDecoder decoder_;
+  std::vector<OregonDevice *> devices_;
 
-  // Helper
-  static float calculate_manchester_quality_(const std::vector<int32_t> &raw);
+  // Oregon sensors send every message twice; skip the identical copy.
+  uint8_t last_message_[ManchesterDecoder::MAX_BYTES]{};
+  size_t last_message_len_{0};
+  uint32_t last_message_time_{0};
 };
 
 }  // namespace oregon_v21_receiver

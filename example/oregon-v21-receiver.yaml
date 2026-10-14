@@ -1,0 +1,64 @@
+# Oregon Scientific RAR501 sensors (THGR122N) via RXB6 433 MHz receiver.
+# Board: ESP32 DevKit (ESP32-WROOM-32D), RXB6 DATA on GPIO17, VCC 5 V, GND.
+
+esphome:
+  name: oregon-v21-receiver
+
+esp32:
+  board: esp32doit-devkit-v1
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+
+ota:
+  - platform: esphome
+
+logger:
+  level: DEBUG
+
+remote_receiver:
+  id: rf_in
+  pin: GPIO17
+  # dump:
+  #   - raw            # enable to capture pulse trains for troubleshooting
+  tolerance: 25%
+  filter: 100us        # must stay well below the 488 us Oregon half bit
+  idle: 4ms
+  buffer_size: 10kb
+
+external_components:
+  - source: github://boilerplate4u/oregon_v21_receiver@main
+    components: [oregon_v21_receiver]
+
+oregon_v21_receiver:
+  receiver_id: rf_in
+  devices:
+    # Channel as shown on the RAR501 (the THGR122N sends 1, 2 and 4 for channels 1, 2 and 3).
+    # Add rolling_code only if two sensors share a channel. It changes when the batteries
+    # are replaced; the log line "No device configured for channel X rolling code Y" shows it.
+    - channel: 1
+      temperature:
+        name: "Oregon CH1 Temperature"
+      humidity:
+        name: "Oregon CH1 Humidity"
+      battery_low:
+        name: "Oregon CH1 Battery Low"
+    - channel: 2
+      temperature:
+        name: "Oregon CH2 Temperature"
+      humidity:
+        name: "Oregon CH2 Humidity"
+      battery_low:
+        name: "Oregon CH2 Battery Low"
+    - channel: 3
+      temperature:
+        name: "Oregon CH3 Temperature"
+      humidity:
+        name: "Oregon CH3 Humidity"
+      battery_low:
+        name: "Oregon CH3 Battery Low"
