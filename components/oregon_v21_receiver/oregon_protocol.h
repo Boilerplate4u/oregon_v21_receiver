@@ -12,11 +12,11 @@
 //
 //   0       sync nibble, always 0xA
 //   1..4    sensor id, read in this order (THGR122N = 1 D 2 0 = 0x1D20)
-//   5       channel (bit coded on 3 channel sensors: 1, 2, 4)
+//   5       channel (bit coded on 3 channel sensors: 1, 2, 4; other values are rejected)
 //   6..7    rolling code (changes when the batteries are replaced)
 //   8       flags, bit 2 = low battery
 //   9..11   temperature BCD: tenths, units, tens
-//   12      temperature sign (bit 3)
+//   12      temperature sign (bit 3); the other bits must be 0 on the supported sensors
 //   13..14  humidity BCD: units, tens        (temperature/humidity sensors)
 //   15      unknown (comfort level)          (temperature/humidity sensors)
 //   next 2  checksum = sum of nibbles 1..N, low nibble first
@@ -46,7 +46,8 @@ struct OregonReading {
   bool has_temperature{false};
   float temperature{0.0f};  // degrees Celsius, outdoor sensor air temperature
   bool has_humidity{false};
-  uint8_t humidity{0};      // percent relative humidity
+  uint8_t humidity{0};    // percent relative humidity
+  uint8_t used_bytes{0};  // bytes covered by the checksum, set once the sensor type is known
 };
 
 /// Nibble n of an Oregon message in nibble order.

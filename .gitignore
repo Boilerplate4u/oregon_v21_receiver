@@ -2,4 +2,6 @@
 **/.DS_Store
 __pycache__/
 *.pyc
-tests/test_decoder
+tests/build/
+ci/
+.esphome/

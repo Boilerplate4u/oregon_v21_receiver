@@ -1,0 +1,62 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    name: Host tests (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Unit and fuzz tests
+        run: tests/run_tests.sh 4
+
+  esphome-compile:
+    name: ESPHome ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "2026.9.1 (oldest tested)"
+            package: "esphome==2026.9.1"
+            experimental: false
+          - name: "latest release"
+            package: "esphome"
+            experimental: false
+          - name: "dev"
+            package: "esphome @ git+https://github.com/esphome/esphome.git@dev"
+            experimental: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install ESPHome
+        run: |
+          pip install "${{ matrix.package }}"
+          echo "ESPHOME_VERSION=$(esphome version | awk '{print $2}')" >> "$GITHUB_ENV"
+      - name: Cache ESP-IDF toolchain
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/esphome
+          key: esphome-${{ env.ESPHOME_VERSION }}-${{ runner.os }}
+      - name: Prepare config from the example
+        run: |
+          mkdir -p ci
+          # Build the checked out component instead of the published one.
+          sed "s#source: github://boilerplate4u/oregon_v21_receiver@main#source:\n      type: local\n      path: ../components#" \
+            example/oregon-v21-receiver.yaml > ci/oregon.yaml
+          grep -q "type: local" ci/oregon.yaml
+          printf 'wifi_ssid: "ci"\nwifi_password: "ci-password"\n' > ci/secrets.yaml
+      - name: Validate config
+        run: esphome config ci/oregon.yaml
+      - name: Compile
+        run: esphome compile ci/oregon.yaml
