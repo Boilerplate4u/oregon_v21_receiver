@@ -54,14 +54,15 @@ ParseResult parse_oregon_v21(const uint8_t *data, size_t len, OregonReading &out
 
   // Checksum occupies the two nibbles after the last checksummed one.
   const size_t checksum_nibble = type->last_checksummed_nibble + 1;
-  if ((checksum_nibble + 1) / 2 + 1 > len)
+  const size_t used_bytes = (checksum_nibble + 1) / 2 + 1;
+  out.used_bytes = static_cast<uint8_t>(used_bytes);
+  if (used_bytes > len)
     return ParseResult::TOO_SHORT;
 
   uint8_t sum = 0;
   for (size_t i = 1; i <= type->last_checksummed_nibble; i++)
     sum += oregon_nibble(data, i);
-  const uint8_t expected =
-      oregon_nibble(data, checksum_nibble) | (oregon_nibble(data, checksum_nibble + 1) << 4);
+  const uint8_t expected = oregon_nibble(data, checksum_nibble) | (oregon_nibble(data, checksum_nibble + 1) << 4);
   if (sum != expected)
     return ParseResult::BAD_CHECKSUM;
 
@@ -70,8 +71,11 @@ ParseResult parse_oregon_v21(const uint8_t *data, size_t len, OregonReading &out
   const uint8_t t_tens = oregon_nibble(data, 11);
   if (!is_bcd(t_tenths) || !is_bcd(t_units) || !is_bcd(t_tens))
     return ParseResult::BAD_VALUE;
+  const uint8_t sign = oregon_nibble(data, 12);
+  if (sign & 0x07)
+    return ParseResult::BAD_VALUE;  // rtl_433 reads these bits as hundreds (AWR129 only)
   float temperature = t_tens * 10.0f + t_units + t_tenths / 10.0f;
-  if (oregon_nibble(data, 12) & 0x08)
+  if (sign & 0x08)
     temperature = -temperature;
   if (temperature < -50.0f || temperature > 70.0f)
     return ParseResult::BAD_VALUE;
@@ -101,7 +105,7 @@ ParseResult parse_oregon_v21(const uint8_t *data, size_t len, OregonReading &out
         channel = 3;
         break;
       default:
-        break;
+        return ParseResult::BAD_VALUE;
     }
   }
 

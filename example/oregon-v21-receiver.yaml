@@ -19,6 +19,8 @@ ota:
   - platform: esphome
 
 logger:
+  # VERBOSE adds a dump of every Manchester message (bytes, raw bit pairs and
+  # pulse widths) and of abandoned candidates. DEBUG is enough for daily use.
   level: DEBUG
 
 remote_receiver:
@@ -37,28 +39,57 @@ external_components:
 
 oregon_v21_receiver:
   receiver_id: rf_in
+  # Diagnostic counters are published every update_interval (default 60s).
+  update_interval: 60s
+  diagnostics:
+    messages:
+      name: "Oregon Messages"
+    checksum_errors:
+      name: "Oregon Checksum Errors"
+    bit_pair_errors:
+      name: "Oregon Bit Pair Errors"
+    rejected:
+      name: "Oregon Rejected Messages"
+    aborted:
+      name: "Oregon Aborted Messages"
   devices:
     # Channel as shown on the RAR501 (the THGR122N sends 1, 2 and 4 for channels 1, 2 and 3).
     # Add rolling_code only if two sensors share a channel. It changes when the batteries
     # are replaced; the log line "No device configured for channel X rolling code Y" shows it.
+    #
+    # The sensors transmit every 39 to 43 s (measured: channel 1 every 39 s, channel 3
+    # every 43 s). The timeout filter makes a value unknown in Home Assistant when a
+    # sensor has not been heard for 5 minutes, instead of showing a stale value.
     - channel: 1
       temperature:
         name: "Oregon CH1 Temperature"
+        filters:
+          - timeout: 5min
       humidity:
         name: "Oregon CH1 Humidity"
+        filters:
+          - timeout: 5min
       battery_low:
         name: "Oregon CH1 Battery Low"
     - channel: 2
       temperature:
         name: "Oregon CH2 Temperature"
+        filters:
+          - timeout: 5min
       humidity:
         name: "Oregon CH2 Humidity"
+        filters:
+          - timeout: 5min
       battery_low:
         name: "Oregon CH2 Battery Low"
     - channel: 3
       temperature:
         name: "Oregon CH3 Temperature"
+        filters:
+          - timeout: 5min
       humidity:
         name: "Oregon CH3 Humidity"
+        filters:
+          - timeout: 5min
       battery_low:
         name: "Oregon CH3 Battery Low"
