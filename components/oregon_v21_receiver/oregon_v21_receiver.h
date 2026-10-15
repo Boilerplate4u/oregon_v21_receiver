@@ -71,6 +71,7 @@ class OregonV21Receiver : public PollingComponent, public remote_base::RemoteRec
  protected:
   bool handle_message_();
   void handle_abort_();
+  void log_abandoned_(uint16_t raw_bits, const uint8_t *data, size_t size, uint32_t pulse_width_us);
   bool is_repeat_(const uint8_t *data, size_t len);
   bool first_unmatched_(uint8_t channel, uint8_t rolling_code);
   void dump_message_verbose_(const char *hex);
