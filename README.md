@@ -27,11 +27,16 @@ RXB6 DATA ─► remote_receiver (RMT, raw pulse widths)
   `rc_switch`, `nexa` and other protocols on the same pin.
 * A message is accepted only when every bit pair is a bit followed by its complement,
   the Oregon nibble checksum matches and all values are valid BCD within range. In fuzz
-  tests with 800 000 damaged captures, 45 damaged messages still had a valid checksum and
-  wrong values; the bit pair check rejected 43 of them. The remaining kind of damage keeps
+  tests with 800 000 damaged captures, 49 damaged messages still had a valid checksum and
+  wrong values; the bit pair check rejected 46 of them. The remaining kind of damage keeps
   every bit pair valid, so only the 8 bit checksum protects against it (see
   [Outliers](#outliers)).
 * Oregon sensors send each message twice. The identical copy within 1.5 s is skipped.
+* A message that breaks off after at least 8 bytes is still checked, because the checksum
+  often lies before the break: the THGR122N sends 10 bytes, but only the first 9 are
+  checksummed. In a 13 minute log from a RXB6 setup, 2 of 19 transmissions from one
+  sensor were lost only because the received copy broke off in that last byte. If the
+  break comes before the end of the checksum, the message counts as aborted.
 
 ## Supported sensors
 
@@ -134,7 +139,7 @@ single outlier at the cost of reporting the middle of the last three values:
 | `checksum_errors` | Complete messages with a wrong checksum. |
 | `bit_pair_errors` | Messages rejected because a bit and its complement were equal. |
 | `rejected` | Other rejected messages: unknown sensor id, invalid values, too short. |
-| `aborted` | Messages that started after a valid preamble but broke off before the end. |
+| `aborted` | Messages that started after a valid preamble but broke off before the end of the checksum. |
 
 The RXB6 has no signal strength output, so the ratio of errors to `messages` is the
 best available measure of reception quality, for example when moving the antenna.
@@ -192,7 +197,7 @@ sensors only report a low battery flag.
 | WARN | Two rolling codes on a channel that has no `rolling_code` configured (see below). |
 | INFO | The first message from each sensor that is not configured, with its channel and rolling code. |
 | DEBUG | Every decoded reading, the raw bytes of every message and the reason when a message is rejected. |
-| VERBOSE | Dump of every Manchester message: byte count, bit pair errors, average short and long pulse width, the bytes and all raw bit pairs grouped per nibble. Also messages abandoned after the preamble and ignored repeats. |
+| VERBOSE | Dump of every Manchester message: byte count, bit pair errors, average short and long pulse width, the bytes and all raw bit pairs grouped per nibble. Also messages abandoned after the preamble, where a message that was checked anyway broke off (`cut off by a ... us pulse`) and ignored repeats. |
 
 Example of the VERBOSE dump:
 

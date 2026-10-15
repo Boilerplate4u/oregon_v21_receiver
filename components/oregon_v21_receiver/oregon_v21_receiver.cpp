@@ -115,17 +115,26 @@ void OregonV21Receiver::handle_abort_() {
   ManchesterDecoder::AbortInfo info;
   if (!this->decoder_.take_abort(info))
     return;
+  this->log_abandoned_(info.raw_bits, info.data, info.size, info.pulse_width_us);
+}
+
+void OregonV21Receiver::log_abandoned_(uint16_t raw_bits, const uint8_t *data, size_t size, uint32_t pulse_width_us) {
   this->aborted_++;
 #if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE
   char hex[HEX_BUFFER_SIZE];
-  format_hex(info.data, info.size, hex, sizeof(hex));
-  if (info.pulse_width_us == 0) {
-    ESP_LOGV(TAG, "Candidate abandoned at end of capture after %u raw bits (%u bytes): %s", info.raw_bits, info.size,
-             hex);
+  format_hex(data, size, hex, sizeof(hex));
+  if (pulse_width_us == 0) {
+    ESP_LOGV(TAG, "Candidate abandoned at end of capture after %u raw bits (%u bytes): %s", raw_bits,
+             static_cast<unsigned>(size), hex);
   } else {
-    ESP_LOGV(TAG, "Candidate abandoned after %u raw bits (%u bytes) at a %" PRIu32 " us pulse: %s", info.raw_bits,
-             info.size, info.pulse_width_us, hex);
+    ESP_LOGV(TAG, "Candidate abandoned after %u raw bits (%u bytes) at a %" PRIu32 " us pulse: %s", raw_bits,
+             static_cast<unsigned>(size), pulse_width_us, hex);
   }
+#else
+  (void) raw_bits;
+  (void) data;
+  (void) size;
+  (void) pulse_width_us;
 #endif
 }
 
@@ -159,6 +168,14 @@ void OregonV21Receiver::dump_message_verbose_(const char *hex) {
            "Manchester message: %u bytes, %u bit pair errors, short %" PRIu32 " us (n=%u), long %" PRIu32 " us (n=%u)",
            static_cast<unsigned>(this->decoder_.size()), this->decoder_.pair_errors(), stats.short_avg_us(),
            stats.short_count, stats.long_avg_us(), stats.long_count);
+  if (this->decoder_.truncated()) {
+    if (this->decoder_.end_pulse_us() == 0) {
+      ESP_LOGV(TAG, "  cut off by the end of the capture after %u raw bits", this->decoder_.raw_bits_received());
+    } else {
+      ESP_LOGV(TAG, "  cut off by a %" PRIu32 " us pulse after %u raw bits", this->decoder_.end_pulse_us(),
+               this->decoder_.raw_bits_received());
+    }
+  }
   ESP_LOGV(TAG, "  bytes: %s", hex);
   // Raw bits in pairs (data bit, complement), one group per nibble, 8 nibbles per line.
   const size_t raw_bits = this->decoder_.raw_bit_count();
@@ -183,12 +200,19 @@ bool OregonV21Receiver::handle_message_() {
   const uint8_t *data = this->decoder_.data();
   const size_t len = this->decoder_.size();
 
+  OregonReading reading;
+  const ParseResult result = parse_oregon_v21(data, len, reading);
+
+  // A message cut off before the end of its checksum is an abandoned candidate,
+  // reported the same way as one cut off before min_bytes.
+  if (this->decoder_.truncated() && result == ParseResult::TOO_SHORT) {
+    this->log_abandoned_(this->decoder_.raw_bits_received(), data, len, this->decoder_.end_pulse_us());
+    return false;
+  }
+
   char hex[HEX_BUFFER_SIZE];
   format_hex(data, len, hex, sizeof(hex));
   this->dump_message_verbose_(hex);
-
-  OregonReading reading;
-  const ParseResult result = parse_oregon_v21(data, len, reading);
 
   // Only the bytes covered by the checksum matter; some sensors send an unused tail.
   const size_t checked_bytes = reading.used_bytes != 0 ? reading.used_bytes : len;

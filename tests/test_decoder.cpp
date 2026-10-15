@@ -1,6 +1,7 @@
 // Host unit tests for the ESPHome independent parts of oregon_v21_receiver.
 // Build and run with tests/run_tests.sh (Debian/WSL, Linux or macOS).
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -180,6 +181,91 @@ static void test_abort_snapshot() {
   CHECK(!quiet.take_abort(info));
 }
 
+// Pulse train for the first `raw_bits` raw bits of a message, cut off by `cut_us`
+// (0: the capture just ends).
+static std::vector<int32_t> cut_capture(const std::vector<uint8_t> &m, size_t raw_bits, int32_t cut_us, uint32_t seed) {
+  auto raw = raw_bits_v21(m);
+  raw.resize(raw_bits);
+  auto pulses = encode_raw(raw, seed);
+  pulses.pop_back();  // the end gap
+  if (cut_us != 0) {
+    pulses.push_back(pulses.back() < 0 ? cut_us : -cut_us);
+    pulses.push_back(-6000);
+  }
+  return pulses;
+}
+
+static void test_truncated_messages() {
+  // Received on 2026-10-15: at 12:47:26 a message broke off after 9 bytes, while the
+  // next transmission arrived complete as 1A 2D 40 F5 81 09 30 C7 50 D9. The checksum
+  // is in byte 8, so 9 bytes are enough. The cut widths below are from the same log.
+  auto m = hex_bytes("1A 2D 40 F5 81 09 30 C7 50 D9");
+  OregonReading full;
+  CHECK(parse_oregon_v21(m.data(), m.size(), full) == ParseResult::OK);
+  const int32_t cuts[] = {150, 1488, 1944, 0};  // glitch, gaps below end_gap, end of capture
+  uint32_t seed = 20;
+  for (int32_t cut : cuts) {
+    for (size_t raw_bits : {size_t(144), size_t(156)}) {
+      ManchesterDecoder dec;
+      auto msgs = decode_capture(cut_capture(m, raw_bits, cut, seed++), dec);
+      CHECK(msgs.size() == 1);
+      if (msgs.size() != 1)
+        continue;
+      CHECK(msgs[0].bytes.size() == 9);
+      CHECK(std::equal(msgs[0].bytes.begin(), msgs[0].bytes.end(), m.begin()));
+      OregonReading r;
+      CHECK(parse_oregon_v21(msgs[0].bytes.data(), msgs[0].bytes.size(), r) == ParseResult::OK);
+      CHECK(std::fabs(r.temperature - 9.8f) < 0.01f && r.humidity == 73 && r.channel == 3);
+    }
+  }
+  {
+    // The decoder reports why the message ended.
+    ManchesterDecoder dec;
+    for (int32_t v : cut_capture(m, 150, 1944, 30))
+      dec.feed(uint32_t(v < 0 ? -v : v));
+    CHECK(dec.is_done() && dec.truncated());
+    CHECK(dec.end_pulse_us() == 1944);
+    CHECK(dec.raw_bits_received() == 150);
+    ManchesterDecoder cap_end;
+    for (int32_t v : cut_capture(m, 150, 0, 31))
+      cap_end.feed(uint32_t(v < 0 ? -v : v));
+    CHECK(cap_end.finish() && cap_end.truncated() && cap_end.end_pulse_us() == 0);
+    // A message that ends with a real end gap is not truncated.
+    ManchesterDecoder normal;
+    for (int32_t v : encode_v21(m, 32))
+      normal.feed(uint32_t(v < 0 ? -v : v));
+    CHECK(normal.is_done() && !normal.truncated());
+  }
+  {
+    // 8 bytes: handed over, but too short for this sensor's checksum.
+    auto msgs = decode_capture(cut_capture(m, 131, 1366, 33));
+    CHECK(msgs.size() == 1);
+    OregonReading r;
+    CHECK(msgs.size() == 1 &&
+          parse_oregon_v21(msgs[0].bytes.data(), msgs[0].bytes.size(), r) == ParseResult::TOO_SHORT);
+  }
+  {
+    // 7 bytes: abandoned as before, nothing is handed over.
+    ManchesterDecoder dec;
+    dec.set_record_aborts(true);
+    auto msgs = decode_capture(cut_capture(m, 125, 1543, 34), dec);
+    CHECK(msgs.empty());
+  }
+  {
+    // A temperature only sensor needs 8 bytes, so a cut after them still gives a reading.
+    auto t = hex_bytes("EA 4C 10 33 00 00 00 00");
+    set_nibble(t, 9, 7);
+    set_nibble(t, 10, 1);
+    set_nibble(t, 11, 2);
+    fix_checksum(t, 12);
+    t.push_back(0x55);
+    auto msgs = decode_capture(cut_capture(t, 8 * 16 + 5, 150, 35));
+    OregonReading r;
+    CHECK(msgs.size() == 1 && parse_oregon_v21(msgs[0].bytes.data(), msgs[0].bytes.size(), r) == ParseResult::OK);
+    CHECK(std::fabs(r.temperature - 21.7f) < 0.01f);
+  }
+}
+
 static void test_two_messages_in_one_capture() {
   auto a = hex_bytes("1A 2D 40 F5 60 08 50 C7 4E A6");
   auto b = hex_bytes("1A 2D 10 FE 40 06 80 C9 55 EE");
@@ -233,6 +319,7 @@ int main(int argc, char **argv) {
   test_bit_pairs();
   test_raw_bits_and_stats();
   test_abort_snapshot();
+  test_truncated_messages();
   test_two_messages_in_one_capture();
   test_real_captures(argc > 1 ? argv[1] : "data/rxb6_raw_frames.txt");
   std::printf(failures == 0 ? "ALL TESTS PASSED\n" : "%d FAILURES\n", failures);

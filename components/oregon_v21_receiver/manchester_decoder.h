@@ -74,6 +74,14 @@ class ManchesterDecoder {
   /// min_bytes was in progress, which is then made available.
   bool finish();
 
+  /// True when the current message did not end with an end gap: a pulse outside the
+  /// Manchester timing or the end of the capture cut it off after at least min_bytes.
+  /// The complete bytes are still made available, because the checksum often lies
+  /// before the cut (THGR122N: 9 of the 10 transmitted bytes are checksummed).
+  bool truncated() const { return this->truncated_; }
+  /// The pulse that cut the message off, 0 when the capture ended.
+  uint32_t end_pulse_us() const { return this->end_pulse_us_; }
+
   bool is_done() const { return this->state_ == DONE; }
   const uint8_t *data() const { return this->data_; }
   size_t size() const { return this->pos_; }
@@ -90,6 +98,8 @@ class ManchesterDecoder {
 
   /// Data bits received (raw bits / 2), including a trailing incomplete byte.
   uint16_t data_bit_count() const { return this->total_bits_ / 2; }
+  /// Raw bits received, including a trailing incomplete byte.
+  uint16_t raw_bits_received() const { return this->total_bits_; }
 
   const PulseStats &pulse_stats() const { return this->stats_; }
 
@@ -122,6 +132,8 @@ class ManchesterDecoder {
   uint8_t flip_{0};
   uint8_t last_first_half_{0};
   State state_{UNKNOWN};
+  bool truncated_{false};
+  uint32_t end_pulse_us_{0};
 
   bool record_aborts_{false};
   uint8_t abort_min_size_{2};

@@ -22,14 +22,24 @@ void ManchesterDecoder::reset() {
   this->flip_ = 0;
   this->last_first_half_ = 0;
   this->state_ = UNKNOWN;
+  this->truncated_ = false;
+  this->end_pulse_us_ = 0;
 }
 
 bool ManchesterDecoder::feed(uint32_t width_us) {
   if (this->state_ != DONE) {
     switch (this->decode_(width_us)) {
       case -1:
-        this->abort_(width_us);
-        this->reset();
+        if (this->state_ != UNKNOWN && this->pos_ >= this->timing_.min_bytes) {
+          // Cut off after enough bytes: hand over the complete bytes and let the
+          // parser decide, exactly as for a message that ends with an end gap.
+          this->truncated_ = true;
+          this->end_pulse_us_ = width_us;
+          this->state_ = DONE;
+        } else {
+          this->abort_(width_us);
+          this->reset();
+        }
         break;
       case 1:
         this->state_ = DONE;
@@ -45,6 +55,8 @@ bool ManchesterDecoder::finish() {
   if (this->state_ == DONE)
     return true;
   if (this->state_ != UNKNOWN && this->pos_ >= this->timing_.min_bytes) {
+    this->truncated_ = true;
+    this->end_pulse_us_ = 0;
     this->state_ = DONE;
     return true;
   }

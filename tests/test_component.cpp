@@ -206,6 +206,40 @@ static void test_rejections_and_counters() {
   CHECK(count_log('D', "bit pair errors (verification disabled)") == 1);
 }
 
+// The THGR122N message from the 12:47:26 log, cut off after `raw_bits` raw bits by `cut_us`.
+static std::vector<int32_t> cut_thgr_capture(size_t raw_bits, int32_t cut_us, uint32_t seed) {
+  auto raw = raw_bits_v21(hex_bytes("1A 2D 40 F5 81 09 30 C7 50 D9"));
+  raw.resize(raw_bits);
+  auto pulses = encode_raw(raw, seed);
+  pulses.back() = pulses[pulses.size() - 2] < 0 ? cut_us : -cut_us;
+  pulses.push_back(-6000);
+  return pulses;
+}
+
+static void test_truncated_candidates() {
+  Rig r;
+  r.add(0, 3);
+  r.rx.setup();
+  receive(r.rx, cut_thgr_capture(144, 1944, 40));  // complete up to the checksum
+  CHECK(r.temp[0].states.size() == 1 && near(r.temp[0].states[0], 9.8f));
+  CHECK(r.hum[0].states.size() == 1 && near(r.hum[0].states[0], 73.0f));
+  CHECK(count_log('V', "cut off by a 1944 us pulse after 144 raw bits") == 1);
+  r.tick(200);
+  receive(r.rx, encode_v21(hex_bytes("1A 2D 40 F5 81 09 30 C7 50 D9"), 41));  // its complete repeat
+  CHECK(r.temp[0].states.size() == 1);
+  r.tick(43000);
+  receive(r.rx, cut_thgr_capture(131, 1366, 42));  // checksum not complete
+  CHECK(r.temp[0].states.size() == 1);
+  CHECK(count_log('V', "Candidate abandoned after 131 raw bits (8 bytes) at a 1366 us pulse") == 1);
+  CHECK(count_log('D', "Rejected") == 0);
+  r.rx.update();
+  CHECK(near(r.messages.states.back(), 1.0f));
+  CHECK(near(r.aborted.states.back(), 1.0f));
+  CHECK(near(r.rejected.states.back(), 0.0f));
+  CHECK(near(r.checksum.states.back(), 0.0f));
+  CHECK(near(r.pairs.states.back(), 0.0f));
+}
+
 int main(int argc, char **argv) {
   test_real_captures(argc > 1 ? argv[1] : "data/rxb6_raw_frames.txt");
   test_repeat_is_ignored();
@@ -213,6 +247,7 @@ int main(int argc, char **argv) {
   test_conflict_warning();
   test_unmatched_logging();
   test_rejections_and_counters();
+  test_truncated_candidates();
   std::printf(failures == 0 ? "COMPONENT TESTS PASSED\n" : "%d COMPONENT FAILURES\n", failures);
   return failures == 0 ? 0 : 1;
 }
