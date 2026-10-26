@@ -15,8 +15,8 @@ static const char *const TAG = "oregon_v21";
 
 // Messages identical to the previous one within this window are treated as the repeat.
 static const uint32_t REPEAT_WINDOW_MS = 1500;
-// Two rolling codes on one channel within this window means two sensors share the channel.
-static const uint32_t ROLLING_CODE_CONFLICT_WINDOW_MS = 10 * 60 * 1000;
+// Two unit_ids on one channel within this window means two remote sensors share the channel.
+static const uint32_t UNIT_ID_CONFLICT_WINDOW_MS = 10 * 60 * 1000;
 
 // Room for MAX_BYTES as "XX " plus the terminator.
 static const size_t HEX_BUFFER_SIZE = ManchesterDecoder::MAX_BYTES * 3 + 1;
@@ -32,15 +32,15 @@ static void format_hex(const uint8_t *data, size_t len, char *out, size_t out_si
   }
 }
 
-bool OregonDevice::matches(const OregonReading &reading) const {
+bool RemoteSensor::matches(const OregonReading &reading) const {
   if (reading.channel != this->channel_)
     return false;
-  if (this->match_rolling_code_ && reading.rolling_code != this->rolling_code_)
+  if (this->match_unit_id_ && reading.unit_id != this->unit_id_)
     return false;
   return true;
 }
 
-void OregonDevice::publish(const OregonReading &reading) {
+void RemoteSensor::publish(const OregonReading &reading) {
   if (this->temperature_sensor_ != nullptr && reading.has_temperature)
     this->temperature_sensor_->publish_state(reading.temperature);
   if (this->humidity_sensor_ != nullptr && reading.has_humidity)
@@ -49,23 +49,23 @@ void OregonDevice::publish(const OregonReading &reading) {
     this->battery_low_binary_sensor_->publish_state(reading.battery_low);
 }
 
-int16_t OregonDevice::check_rolling_code_change(uint8_t rolling_code, uint32_t now, uint32_t window_ms) {
+int16_t RemoteSensor::check_unit_id_change(uint8_t unit_id, uint32_t now, uint32_t window_ms) {
   int16_t previous = -1;
-  if (this->last_rolling_code_ >= 0 && this->last_rolling_code_ != rolling_code &&
-      (now - this->last_rolling_code_time_) < window_ms && !this->rolling_code_warned_) {
-    previous = this->last_rolling_code_;
-    this->rolling_code_warned_ = true;
+  if (this->last_unit_id_ >= 0 && this->last_unit_id_ != unit_id && (now - this->last_unit_id_time_) < window_ms &&
+      !this->unit_id_warned_) {
+    previous = this->last_unit_id_;
+    this->unit_id_warned_ = true;
   }
-  this->last_rolling_code_ = rolling_code;
-  this->last_rolling_code_time_ = now;
+  this->last_unit_id_ = unit_id;
+  this->last_unit_id_time_ = now;
   return previous;
 }
 
-void OregonDevice::dump_config() const {
-  if (this->match_rolling_code_) {
-    ESP_LOGCONFIG(TAG, "  Device: channel %u, rolling code %u", this->channel_, this->rolling_code_);
+void RemoteSensor::dump_config() const {
+  if (this->match_unit_id_) {
+    ESP_LOGCONFIG(TAG, "  Remote sensor: channel %u, unit_id %02X", this->channel_, this->unit_id_);
   } else {
-    ESP_LOGCONFIG(TAG, "  Device: channel %u, any rolling code", this->channel_);
+    ESP_LOGCONFIG(TAG, "  Remote sensor: channel %u, any unit_id", this->channel_);
   }
   LOG_SENSOR("    ", "Temperature", this->temperature_sensor_);
   LOG_SENSOR("    ", "Humidity", this->humidity_sensor_);
@@ -148,14 +148,14 @@ bool OregonV21Receiver::is_repeat_(const uint8_t *data, size_t len) {
   return repeat;
 }
 
-bool OregonV21Receiver::first_unmatched_(uint8_t channel, uint8_t rolling_code) {
-  const uint16_t key = uint16_t(channel) << 8 | rolling_code;
-  for (uint8_t i = 0; i < this->unmatched_count_; i++) {
-    if (this->unmatched_seen_[i] == key)
+bool OregonV21Receiver::first_unlisted_(uint8_t channel, uint8_t unit_id) {
+  const uint16_t key = uint16_t(channel) << 8 | unit_id;
+  for (uint8_t i = 0; i < this->unlisted_count_; i++) {
+    if (this->unlisted_seen_[i] == key)
       return false;
   }
-  if (this->unmatched_count_ < MAX_UNMATCHED) {
-    this->unmatched_seen_[this->unmatched_count_++] = key;
+  if (this->unlisted_count_ < MAX_UNLISTED) {
+    this->unlisted_seen_[this->unlisted_count_++] = key;
     return true;
   }
   return false;  // table full: stay quiet rather than flood the log
@@ -214,6 +214,9 @@ bool OregonV21Receiver::handle_message_() {
   format_hex(data, len, hex, sizeof(hex));
   this->dump_message_verbose_(hex);
 
+  if (result == ParseResult::UNKNOWN_TYPE)
+    return this->handle_unknown_type_(data, len, hex);
+
   // Only the bytes covered by the checksum matter; some sensors send an unused tail.
   const size_t checked_bytes = reading.used_bytes != 0 ? reading.used_bytes : len;
   const uint16_t pair_errors = this->decoder_.pair_errors(checked_bytes);
@@ -232,8 +235,7 @@ bool OregonV21Receiver::handle_message_() {
     } else {
       this->rejected_++;
     }
-    ESP_LOGD(TAG, "Rejected message (%s, sensor id 0x%04X): %s", parse_result_to_string(result), reading.sensor_id,
-             hex);
+    ESP_LOGD(TAG, "Rejected message (%s, type %04X): %s", parse_result_to_string(result), reading.type, hex);
     return false;
   }
 
@@ -245,50 +247,96 @@ bool OregonV21Receiver::handle_message_() {
 
   ESP_LOGD(TAG, "Message: %s", hex);
   if (reading.has_humidity) {
-    ESP_LOGD(TAG, "%s channel %u (raw %u) rolling code %u: %.1f °C, %u %%, battery %s", reading.model, reading.channel,
-             reading.channel_raw, reading.rolling_code, reading.temperature, reading.humidity,
+    ESP_LOGD(TAG, "%s type %04X, channel %u, unit_id %02X: %.1f °C, %u %%, battery %s", reading.model, reading.type,
+             reading.channel, reading.unit_id, reading.temperature, reading.humidity,
              reading.battery_low ? "low" : "ok");
   } else {
-    ESP_LOGD(TAG, "%s channel %u (raw %u) rolling code %u: %.1f °C, battery %s", reading.model, reading.channel,
-             reading.channel_raw, reading.rolling_code, reading.temperature, reading.battery_low ? "low" : "ok");
+    ESP_LOGD(TAG, "%s type %04X, channel %u, unit_id %02X: %.1f °C, battery %s", reading.model, reading.type,
+             reading.channel, reading.unit_id, reading.temperature, reading.battery_low ? "low" : "ok");
   }
 
-  // Devices with a matching rolling code take precedence over devices for the whole channel.
+  // Remote sensors with a matching unit_id take precedence over those for the whole channel.
   bool matched = false;
-  for (auto *device : this->devices_) {
-    if (device->has_rolling_code() && device->matches(reading)) {
-      device->publish(reading);
+  for (auto *remote_sensor : this->remote_sensors_) {
+    if (remote_sensor->has_unit_id() && remote_sensor->matches(reading)) {
+      remote_sensor->publish(reading);
       matched = true;
     }
   }
   if (!matched) {
     const uint32_t now = millis();
-    for (auto *device : this->devices_) {
-      if (!device->has_rolling_code() && device->matches(reading)) {
-        const int16_t previous =
-            device->check_rolling_code_change(reading.rolling_code, now, ROLLING_CODE_CONFLICT_WINDOW_MS);
+    for (auto *remote_sensor : this->remote_sensors_) {
+      if (!remote_sensor->has_unit_id() && remote_sensor->matches(reading)) {
+        const int16_t previous = remote_sensor->check_unit_id_change(reading.unit_id, now, UNIT_ID_CONFLICT_WINDOW_MS);
         if (previous >= 0) {
           ESP_LOGW(TAG,
-                   "Channel %u received from rolling codes %d and %u within 10 minutes. If a neighbour's sensor "
-                   "uses the same channel, set 'rolling_code: %u' on your device. Ignore this after a battery change.",
-                   reading.channel, previous, reading.rolling_code, reading.rolling_code);
+                   "Channel %u received from unit_id %02X and %02X within 10 minutes. If a neighbour's sensor uses "
+                   "the same channel, set 'unit_id: 0x%02X' on your remote sensor. Ignore this after a battery "
+                   "change.",
+                   reading.channel, previous, reading.unit_id, reading.unit_id);
         }
-        device->publish(reading);
+        remote_sensor->publish(reading);
         matched = true;
       }
     }
   }
-  if (!matched) {
-    if (this->first_unmatched_(reading.channel, reading.rolling_code)) {
+  // Without any remote_sensors (logging only) there is nothing to point out.
+  if (!matched && !this->remote_sensors_.empty()) {
+    if (this->first_unlisted_(reading.channel, reading.unit_id)) {
       ESP_LOGI(TAG,
-               "%s on channel %u with rolling code %u is not configured; add it under 'devices:' to use it "
+               "%s type %04X, channel %u, unit_id %02X is not listed under remote_sensors, values not published "
                "(further messages from it are logged at DEBUG)",
-               reading.model, reading.channel, reading.rolling_code);
+               reading.model, reading.type, reading.channel, reading.unit_id);
     } else {
-      ESP_LOGD(TAG, "No device configured for channel %u rolling code %u", reading.channel, reading.rolling_code);
+      ESP_LOGD(TAG, "Channel %u (unit_id %02X) not listed under remote_sensors, values not published", reading.channel,
+               reading.unit_id);
     }
   }
   return true;
+}
+
+bool OregonV21Receiver::handle_unknown_type_(const uint8_t *data, size_t len, const char *hex) {
+  UnknownOregonMessage msg;
+  if (!parse_unknown_oregon_v21(data, len, msg)) {
+    this->rejected_++;
+    ESP_LOGD(TAG, "Rejected message (unknown type %04X, no checksum found): %s", oregon_type(data, len), hex);
+    return false;
+  }
+  const uint16_t pair_errors = this->decoder_.pair_errors(msg.used_bytes);
+  if (pair_errors > 0 && this->verify_bit_pairs_) {
+    this->bit_pair_errors_++;
+    ESP_LOGD(TAG, "Rejected message (unknown type %04X, %u bit pair errors): %s", msg.type, pair_errors, hex);
+    return false;
+  }
+  // Not published to any sensor; counted as rejected for the diagnostics.
+  this->rejected_++;
+  if (this->is_repeat_(data, msg.used_bytes)) {
+    ESP_LOGV(TAG, "Repeat of previous message ignored: %s", hex);
+    return false;
+  }
+
+  // Nibbles up to and including the checksum, as "A 1 D 2 0 ...".
+  char nibbles[2 * ManchesterDecoder::MAX_BYTES * 2 + 1];
+  size_t pos = 0;
+  const size_t last = size_t(msg.last_checksummed_nibble) + 2;
+  for (size_t i = 0; i <= last && pos + 3 <= sizeof(nibbles); i++) {
+    nibbles[pos++] = "0123456789ABCDEF"[oregon_nibble(data, i)];
+    nibbles[pos++] = ' ';
+  }
+  nibbles[pos > 0 ? pos - 1 : 0] = '\0';
+
+  ESP_LOGD(TAG, "Oregon v2.1 unknown type %04X, channel %u, unit_id %02X, flags %X, checksum over %u nibbles%s",
+           msg.type, msg.channel_raw, msg.unit_id, msg.flags, msg.last_checksummed_nibble,
+           msg.checksum_matches > 1 ? " (several positions match)" : "");
+  ESP_LOGD(TAG, "  nibbles: %s", nibbles);
+  if (pair_errors > 0)
+    ESP_LOGD(TAG, "  %u bit pair errors (verification disabled)", pair_errors);
+  if (msg.has_guessed_temperature && msg.has_guessed_humidity) {
+    ESP_LOGD(TAG, "  guessed (THGR122N layout): %.1f °C, %u %%", msg.guessed_temperature, msg.guessed_humidity);
+  } else if (msg.has_guessed_temperature) {
+    ESP_LOGD(TAG, "  guessed (THGR122N layout): %.1f °C", msg.guessed_temperature);
+  }
+  return false;
 }
 
 void OregonV21Receiver::dump_config() {
@@ -305,8 +353,8 @@ void OregonV21Receiver::dump_config() {
   LOG_SENSOR("  ", "Bit pair errors", this->bit_pair_errors_sensor_);
   LOG_SENSOR("  ", "Rejected", this->rejected_sensor_);
   LOG_SENSOR("  ", "Aborted", this->aborted_sensor_);
-  for (auto *device : this->devices_)
-    device->dump_config();
+  for (auto *remote_sensor : this->remote_sensors_)
+    remote_sensor->dump_config();
 }
 
 }  // namespace oregon_v21_receiver

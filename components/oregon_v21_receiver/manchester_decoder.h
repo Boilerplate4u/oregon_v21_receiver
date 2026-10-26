@@ -36,7 +36,7 @@ class ManchesterDecoder {
     uint32_t long_pulse_us{700};  // pulses at or above this are "long"
     uint32_t max_pulse_us{1200};  // longer pulses are treated as noise
     uint32_t end_gap_us{2500};    // a gap this long ends a message
-    uint8_t min_preamble{24};     // long pulses required before the first short pulse
+    uint8_t min_preamble{20};     // long pulses required before the first short pulse
     uint8_t min_bytes{8};         // shortest accepted message
   };
 

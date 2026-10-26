@@ -58,5 +58,13 @@ jobs:
           printf 'wifi_ssid: "ci"\nwifi_password: "ci-password"\n' > ci/secrets.yaml
       - name: Validate config
         run: esphome config ci/oregon.yaml
+      - name: Validate deprecated names (devices, rolling_code)
+        run: |
+          sed -e "s/^  remote_sensors:/  devices:/" -e "s/^    - channel: 1$/    - channel: 1\n      rolling_code: 0x7B/" \
+            ci/oregon.yaml > ci/oregon-legacy.yaml
+          grep -q "rolling_code: 0x7B" ci/oregon-legacy.yaml
+          esphome config ci/oregon-legacy.yaml 2>&1 | tee ci/legacy.log
+          grep -q "'devices' is deprecated" ci/legacy.log
+          grep -q "'rolling_code' is deprecated" ci/legacy.log
       - name: Compile
         run: esphome compile ci/oregon.yaml

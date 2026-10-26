@@ -52,10 +52,11 @@ oregon_v21_receiver:
       name: "Oregon Rejected Messages"
     aborted:
       name: "Oregon Aborted Messages"
-  devices:
+  # One entry per wireless Oregon remote sensor (THGR122N and compatible).
+  remote_sensors:
     # Channel as shown on the RAR501 (the THGR122N sends 1, 2 and 4 for channels 1, 2 and 3).
-    # Add rolling_code only if two sensors share a channel. It changes when the batteries
-    # are replaced; the log line "No device configured for channel X rolling code Y" shows it.
+    # Add unit_id only if two remote sensors share a channel. It changes when the batteries
+    # are replaced; the log line "... is not listed under remote_sensors" shows it.
     #
     # The sensors transmit every 39 to 43 s (measured: channel 1 every 39 s, channel 3
     # every 43 s). The timeout filter makes a value unknown in Home Assistant when a

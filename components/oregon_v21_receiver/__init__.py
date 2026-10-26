@@ -12,7 +12,6 @@ from esphome.components import binary_sensor, remote_base, sensor
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_CHANNEL,
-    CONF_DEVICES,
     CONF_FILTER,
     CONF_HUMIDITY,
     CONF_ID,
@@ -36,7 +35,11 @@ AUTO_LOAD = ["sensor", "binary_sensor"]
 
 CONF_RECEIVER_ID = "receiver_id"
 CONF_LEGACY_RECEIVER_ID = "remote_receiver_id"
-CONF_ROLLING_CODE = "rolling_code"
+CONF_REMOTE_SENSORS = "remote_sensors"
+CONF_UNIT_ID = "unit_id"
+# Names before 2026-10, still accepted with a deprecation warning.
+CONF_LEGACY_DEVICES = "devices"
+CONF_LEGACY_ROLLING_CODE = "rolling_code"
 CONF_BATTERY_LOW = "battery_low"
 CONF_TIMING = "timing"
 CONF_MIN_PULSE = "min_pulse"
@@ -69,7 +72,7 @@ oregon_ns = cg.esphome_ns.namespace("oregon_v21_receiver")
 OregonV21Receiver = oregon_ns.class_(
     "OregonV21Receiver", cg.PollingComponent, remote_base.RemoteReceiverListener
 )
-OregonDevice = oregon_ns.class_("OregonDevice")
+RemoteSensor = oregon_ns.class_("RemoteSensor")
 ManchesterTiming = oregon_ns.namespace("ManchesterDecoder").struct("Timing")
 
 
@@ -80,11 +83,23 @@ def _migrate_legacy_config(config):
     ]
     if legacy_sensors:
         raise cv.Invalid(
-            f"'{legacy_sensors[0]}' is no longer supported. Use a 'devices:' list with "
+            f"'{legacy_sensors[0]}' is no longer supported. Use a 'remote_sensors:' list with "
             "'channel:', 'temperature:', 'humidity:' and 'battery_low:' (a binary sensor) "
             "per sensor, see example/oregon-v21-receiver.yaml.",
             path=[legacy_sensors[0]],
         )
+    if CONF_LEGACY_DEVICES in config:
+        if CONF_REMOTE_SENSORS in config:
+            raise cv.Invalid(
+                f"Use either '{CONF_REMOTE_SENSORS}' or '{CONF_LEGACY_DEVICES}', not both"
+            )
+        _LOGGER.warning(
+            "oregon_v21_receiver: '%s' is deprecated, rename it to '%s'",
+            CONF_LEGACY_DEVICES,
+            CONF_REMOTE_SENSORS,
+        )
+        config = config.copy()
+        config[CONF_REMOTE_SENSORS] = config.pop(CONF_LEGACY_DEVICES)
     if CONF_LEGACY_RECEIVER_ID in config:
         if CONF_RECEIVER_ID in config:
             raise cv.Invalid(
@@ -96,14 +111,32 @@ def _migrate_legacy_config(config):
     return config
 
 
-def _validate_devices(config):
+def _migrate_rolling_code(config):
+    """Accept 'rolling_code' as the old name of 'unit_id'."""
+    if CONF_LEGACY_ROLLING_CODE not in config:
+        return config
+    if CONF_UNIT_ID in config:
+        raise cv.Invalid(
+            f"Use either '{CONF_UNIT_ID}' or '{CONF_LEGACY_ROLLING_CODE}', not both"
+        )
+    _LOGGER.warning(
+        "oregon_v21_receiver: '%s' is deprecated, rename it to '%s'",
+        CONF_LEGACY_ROLLING_CODE,
+        CONF_UNIT_ID,
+    )
+    config = config.copy()
+    config[CONF_UNIT_ID] = config.pop(CONF_LEGACY_ROLLING_CODE)
+    return config
+
+
+def _validate_remote_sensors(config):
     seen = set()
-    for device in config.get(CONF_DEVICES, []):
-        key = (device[CONF_CHANNEL], device.get(CONF_ROLLING_CODE))
+    for remote_sensor in config.get(CONF_REMOTE_SENSORS, []):
+        key = (remote_sensor[CONF_CHANNEL], remote_sensor.get(CONF_UNIT_ID))
         if key in seen:
             raise cv.Invalid(
-                f"Duplicate device for channel {key[0]}"
-                + (f" and rolling code {key[1]}" if key[1] is not None else "")
+                f"Duplicate remote sensor for channel {key[0]}"
+                + (f" and unit_id 0x{key[1]:02X}" if key[1] is not None else "")
             )
         seen.add(key)
     return config
@@ -122,12 +155,13 @@ def _validate_timing(config):
     return config
 
 
-DEVICE_SCHEMA = cv.All(
+REMOTE_SENSOR_SCHEMA = cv.All(
+    _migrate_rolling_code,
     cv.Schema(
         {
-            cv.GenerateID(): cv.declare_id(OregonDevice),
+            cv.GenerateID(): cv.declare_id(RemoteSensor),
             cv.Required(CONF_CHANNEL): cv.int_range(min=1, max=15),
-            cv.Optional(CONF_ROLLING_CODE): cv.int_range(min=0, max=255),
+            cv.Optional(CONF_UNIT_ID): cv.int_range(min=0, max=255),
             cv.Optional(CONF_TEMPERATURE): sensor.sensor_schema(
                 unit_of_measurement=UNIT_CELSIUS,
                 accuracy_decimals=1,
@@ -164,7 +198,8 @@ TIMING_SCHEMA = cv.All(
             cv.Optional(
                 CONF_END_GAP, default="2500us"
             ): cv.positive_time_period_microseconds,
-            cv.Optional(CONF_MIN_PREAMBLE, default=24): cv.int_range(min=8, max=64),
+            # 20 instead of 24: CC1101 captures showed preambles of 21 to 23 long pulses
+            cv.Optional(CONF_MIN_PREAMBLE, default=20): cv.int_range(min=8, max=64),
         }
     ),
     _validate_timing,
@@ -187,13 +222,15 @@ CONFIG_SCHEMA = cv.All(
         {
             cv.GenerateID(): cv.declare_id(OregonV21Receiver),
             cv.GenerateID(CONF_RECEIVER_ID): cv.use_id(remote_base.RemoteReceiverBase),
-            cv.Optional(CONF_DEVICES, default=[]): cv.ensure_list(DEVICE_SCHEMA),
+            cv.Optional(CONF_REMOTE_SENSORS, default=[]): cv.ensure_list(
+                REMOTE_SENSOR_SCHEMA
+            ),
             cv.Optional(CONF_TIMING, default={}): TIMING_SCHEMA,
             cv.Optional(CONF_VERIFY_BIT_PAIRS, default=True): cv.boolean,
             cv.Optional(CONF_DIAGNOSTICS, default={}): DIAGNOSTICS_SCHEMA,
         }
     ).extend(cv.polling_component_schema("60s")),
-    _validate_devices,
+    _validate_remote_sensors,
 )
 
 
@@ -264,20 +301,18 @@ async def to_code(config):
             sens = await sensor.new_sensor(config[CONF_DIAGNOSTICS][key])
             cg.add(getattr(var, f"set_{key}_sensor")(sens))
 
-    for device_config in config[CONF_DEVICES]:
-        device = cg.new_Pvariable(device_config[CONF_ID])
-        cg.add(device.set_channel(device_config[CONF_CHANNEL]))
-        if CONF_ROLLING_CODE in device_config:
-            cg.add(device.set_rolling_code(device_config[CONF_ROLLING_CODE]))
-        if CONF_TEMPERATURE in device_config:
-            sens = await sensor.new_sensor(device_config[CONF_TEMPERATURE])
-            cg.add(device.set_temperature_sensor(sens))
-        if CONF_HUMIDITY in device_config:
-            sens = await sensor.new_sensor(device_config[CONF_HUMIDITY])
-            cg.add(device.set_humidity_sensor(sens))
-        if CONF_BATTERY_LOW in device_config:
-            bsens = await binary_sensor.new_binary_sensor(
-                device_config[CONF_BATTERY_LOW]
-            )
-            cg.add(device.set_battery_low_binary_sensor(bsens))
-        cg.add(var.add_device(device))
+    for rs_config in config[CONF_REMOTE_SENSORS]:
+        remote_sensor = cg.new_Pvariable(rs_config[CONF_ID])
+        cg.add(remote_sensor.set_channel(rs_config[CONF_CHANNEL]))
+        if CONF_UNIT_ID in rs_config:
+            cg.add(remote_sensor.set_unit_id(rs_config[CONF_UNIT_ID]))
+        if CONF_TEMPERATURE in rs_config:
+            sens = await sensor.new_sensor(rs_config[CONF_TEMPERATURE])
+            cg.add(remote_sensor.set_temperature_sensor(sens))
+        if CONF_HUMIDITY in rs_config:
+            sens = await sensor.new_sensor(rs_config[CONF_HUMIDITY])
+            cg.add(remote_sensor.set_humidity_sensor(sens))
+        if CONF_BATTERY_LOW in rs_config:
+            bsens = await binary_sensor.new_binary_sensor(rs_config[CONF_BATTERY_LOW])
+            cg.add(remote_sensor.set_battery_low_binary_sensor(bsens))
+        cg.add(var.add_remote_sensor(remote_sensor))

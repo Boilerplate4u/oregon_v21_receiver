@@ -26,10 +26,10 @@ static void test_known_message() {
   auto m = hex_bytes("1A 2D 40 F5 60 08 50 C7 4E A6");
   OregonReading r;
   CHECK(parse_oregon_v21(m.data(), m.size(), r) == ParseResult::OK);
-  CHECK(r.sensor_id == 0x1D20);
+  CHECK(r.type == 0x1D20);
   CHECK(r.channel_raw == 4);
   CHECK(r.channel == 3);
-  CHECK(r.rolling_code == 245);
+  CHECK(r.unit_id == 245);
   CHECK(std::fabs(r.temperature - 8.6f) < 0.01f);
   CHECK(r.has_humidity && r.humidity == 75);
   CHECK(!r.battery_low);
@@ -43,9 +43,9 @@ static void test_known_message() {
   bad_sync[0] = 0x1B;
   CHECK(parse_oregon_v21(bad_sync.data(), bad_sync.size(), r) == ParseResult::BAD_SYNC);
   auto unknown = m;
-  unknown[1] = 0x2E;  // sensor id 0x1E20
-  CHECK(parse_oregon_v21(unknown.data(), unknown.size(), r) == ParseResult::UNKNOWN_SENSOR);
-  CHECK(r.sensor_id == 0x1E20);
+  unknown[1] = 0x2E;  // type 0x1E20
+  CHECK(parse_oregon_v21(unknown.data(), unknown.size(), r) == ParseResult::UNKNOWN_TYPE);
+  CHECK(r.type == 0x1E20);
   // Checksum still valid but a non BCD temperature digit.
   auto non_bcd = m;
   set_nibble(non_bcd, 10, 0xC);
@@ -88,7 +88,7 @@ static void test_round_trips() {
     CHECK(r.humidity == 43);
     CHECK(r.battery_low);
     CHECK(r.channel == 2);
-    CHECK(r.rolling_code == 0x7B);
+    CHECK(r.unit_id == 0x7B);
   }
   {
     auto m = hex_bytes("EA 4C 10 33 00 00 00 00");  // THN132N, id 0xEC40, channel 1
@@ -100,7 +100,7 @@ static void test_round_trips() {
     OregonReading r;
     CHECK(msgs.size() == 1);
     CHECK(!msgs.empty() && parse_oregon_v21(msgs[0].bytes.data(), msgs[0].bytes.size(), r) == ParseResult::OK);
-    CHECK(r.sensor_id == 0xEC40);
+    CHECK(r.type == 0xEC40);
     CHECK(!r.has_humidity);
     CHECK(std::fabs(r.temperature - 21.7f) < 0.01f);
   }
@@ -297,9 +297,8 @@ static void test_real_captures(const std::string &path) {
         std::printf(" %02X", b);
       if (res == ParseResult::OK) {
         decoded++;
-        std::printf("  -> %s ch %u (raw %u) rc %u %.1f C %u %% battery %s, pair errors %u\n", r.model, r.channel,
-                    r.channel_raw, r.rolling_code, r.temperature, r.humidity, r.battery_low ? "low" : "ok",
-                    msg.pair_errors);
+        std::printf("  -> %s ch %u (raw %u) unit_id %02X %.1f C %u %% battery %s, pair errors %u\n", r.model, r.channel,
+                    r.channel_raw, r.unit_id, r.temperature, r.humidity, r.battery_low ? "low" : "ok", msg.pair_errors);
       } else {
         std::printf("  -> %s\n", parse_result_to_string(res));
       }
@@ -313,7 +312,56 @@ static void test_real_captures(const std::string &path) {
   CHECK(noise_hits == 0);
 }
 
+static void test_unknown_type() {
+  // A THGR122N message with its type changed to 0x1A3D and a recomputed checksum.
+  auto m = hex_bytes("1A 2D 10 7B 10 09 80 C9 4A CC");
+  set_nibble(m, 1, 0x1);
+  set_nibble(m, 2, 0xA);
+  set_nibble(m, 3, 0x3);
+  set_nibble(m, 4, 0xD);
+  fix_checksum(m, 15);
+  OregonReading r;
+  CHECK(parse_oregon_v21(m.data(), m.size(), r) == ParseResult::UNKNOWN_TYPE);
+  CHECK(r.type == 0x1A3D);
+  UnknownOregonMessage u;
+  CHECK(parse_unknown_oregon_v21(m.data(), m.size(), u));
+  CHECK(u.type == 0x1A3D);
+  CHECK(u.last_checksummed_nibble == 15);
+  CHECK(u.used_bytes == 9);
+  CHECK(u.channel_raw == 1);
+  CHECK(u.unit_id == 0x7B);
+  CHECK(u.has_guessed_temperature && std::fabs(u.guessed_temperature - 9.1f) < 0.01f);
+  CHECK(u.has_guessed_humidity && u.guessed_humidity == 98);
+
+  // A shorter checksummed range (temperature only layout) is found too; no humidity guess.
+  auto t = hex_bytes("EA 4C 10 33 00 00 00 00");
+  set_nibble(t, 1, 0xF);  // type 0xFC40, unknown
+  set_nibble(t, 9, 7);
+  set_nibble(t, 10, 1);
+  set_nibble(t, 11, 2);
+  fix_checksum(t, 12);
+  CHECK(parse_unknown_oregon_v21(t.data(), t.size(), u));
+  CHECK(u.last_checksummed_nibble == 12);
+  CHECK(u.has_guessed_temperature && std::fabs(u.guessed_temperature - 21.7f) < 0.01f);
+  CHECK(!u.has_guessed_humidity);
+
+  // No checksum position matches: not Oregon framing.
+  auto broken = m;
+  broken[7] ^= 0x11;
+  broken[8] ^= 0x22;
+  bool any = parse_unknown_oregon_v21(broken.data(), broken.size(), u);
+  CHECK(!any || u.last_checksummed_nibble != 15);
+  // Wrong sync nibble.
+  auto bad_sync = m;
+  bad_sync[0] = 0x1B;
+  CHECK(!parse_unknown_oregon_v21(bad_sync.data(), bad_sync.size(), u));
+  // Known types are not touched by the unknown path.
+  auto known = hex_bytes("1A 2D 40 F5 60 08 50 C7 4E A6");
+  CHECK(parse_oregon_v21(known.data(), known.size(), r) == ParseResult::OK);
+}
+
 int main(int argc, char **argv) {
+  test_unknown_type();
   test_known_message();
   test_round_trips();
   test_bit_pairs();

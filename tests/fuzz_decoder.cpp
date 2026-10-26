@@ -60,7 +60,7 @@ static void fuzz_random_pulses(uint32_t iterations, std::mt19937 &rng) {
   std::uniform_int_distribution<int> kind(0, 9);
   std::uniform_int_distribution<uint32_t> len_dist(0, 1500);
   uint64_t full_buffer = 0;
-  uint64_t messages = 0, accepted = 0;
+  uint64_t messages = 0, accepted = 0, unknown_shown = 0;
   for (uint32_t it = 0; it < iterations; it++) {
     std::vector<int32_t> raw;
     if (it & 1) {
@@ -114,15 +114,23 @@ static void fuzz_random_pulses(uint32_t iterations, std::mt19937 &rng) {
       CHECK(m.bytes.size() <= ManchesterDecoder::MAX_BYTES);
       CHECK(m.bytes.size() >= dec.get_timing().min_bytes);
       OregonReading r;
-      if (parse_oregon_v21(m.bytes.data(), m.bytes.size(), r) == ParseResult::OK) {
+      const ParseResult res = parse_oregon_v21(m.bytes.data(), m.bytes.size(), r);
+      if (res == ParseResult::OK) {
         accepted++;
         CHECK(recheck_accepted(m.bytes, r));
       }
+      // Same rule as OregonV21Receiver: an unknown type is only logged when it has the
+      // framing and its checksummed bytes pass the bit pair check.
+      UnknownOregonMessage u;
+      if (res == ParseResult::UNKNOWN_TYPE && parse_unknown_oregon_v21(m.bytes.data(), m.bytes.size(), u) &&
+          m.pair_errors_in(u.used_bytes) == 0)
+        unknown_shown++;
     }
   }
-  std::printf("random pulses: %u captures, %llu candidate messages (%llu near the buffer limit), %llu accepted\n",
+  std::printf("random pulses: %u captures, %llu candidate messages (%llu near the buffer limit), %llu accepted, "
+              "%llu logged as unknown type\n",
               iterations, (unsigned long long) messages, (unsigned long long) full_buffer,
-              (unsigned long long) accepted);
+              (unsigned long long) accepted, (unsigned long long) unknown_shown);
   CHECK(messages > 0);
   CHECK(full_buffer > 0);
 }
@@ -194,12 +202,19 @@ struct Reference {
 
 static void fuzz_mutations(uint32_t iterations, std::mt19937 &rng, const std::vector<Reference> &refs) {
   uint64_t decoded_ok = 0, false_accept_checksum_only = 0, false_accept_with_pairs = 0, rejected_by_pairs = 0;
+  uint64_t unknown_shown = 0;
   for (uint32_t it = 0; it < iterations; it++) {
     const auto &ref = refs[it % refs.size()];
     auto msgs = decode_capture(mutate(ref.pulses, rng, 1 + int(rng() % 3)));
     for (auto &m : msgs) {
       OregonReading r;
-      if (parse_oregon_v21(m.bytes.data(), m.bytes.size(), r) != ParseResult::OK)
+      const ParseResult res = parse_oregon_v21(m.bytes.data(), m.bytes.size(), r);
+      if (res == ParseResult::UNKNOWN_TYPE) {
+        UnknownOregonMessage u;
+        if (parse_unknown_oregon_v21(m.bytes.data(), m.bytes.size(), u) && m.pair_errors_in(u.used_bytes) == 0)
+          unknown_shown++;
+      }
+      if (res != ParseResult::OK)
         continue;
       CHECK(recheck_accepted(m.bytes, r));
       // Compare the checksummed part only; the tail after the checksum is unused.
@@ -232,6 +247,9 @@ static void fuzz_mutations(uint32_t iterations, std::mt19937 &rng, const std::ve
   std::printf("  wrong values accepted with checksum only: %llu\n", (unsigned long long) false_accept_checksum_only);
   std::printf("  wrong values accepted with bit pair check: %llu (%llu caught by the pair check)\n",
               (unsigned long long) false_accept_with_pairs, (unsigned long long) rejected_by_pairs);
+  // Damage in the type nibbles turns a known message into an unknown type. It is only
+  // logged at DEBUG and never published.
+  std::printf("  damaged messages logged as unknown type: %llu\n", (unsigned long long) unknown_shown);
   // The pair check cannot catch damage that keeps every pair complementary (for example a
   // section with inverted polarity); then only the 8 bit checksum protects. Require that the
   // pair check removes at least 90 % of the wrong values that pass the checksum.
