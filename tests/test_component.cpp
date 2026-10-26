@@ -286,6 +286,69 @@ static void test_truncated_candidates() {
   CHECK(near(r.pairs.states.back(), 0.0f));
 }
 
+static uint32_t capture_ms(const std::vector<int32_t> &raw) {
+  uint64_t us = 0;
+  for (int32_t v : raw)
+    us += v < 0 ? uint64_t(-(int64_t) v) : uint64_t(v);
+  return uint32_t(us / 1000);
+}
+
+static void test_rssi() {
+  Rig r;
+  r.add(0, 1);
+  r.add(1, 2);
+  sensor::Sensor rssi0;
+  r.dev[0].set_rssi_sensor(&rssi0);  // channel 2 has no rssi sensor
+  auto cap = thgr_capture(1, 0x42, 2, 1, 1);
+  const uint32_t len = capture_ms(cap);
+  CHECK(len > 50);
+
+  // Samples: one from an older frame, two during this capture (strongest wins).
+  r.tick(5000);
+  const uint32_t start = test_millis();
+  r.rx.add_rssi_sample(start - 2000, 0x30);      // older frame, much stronger: ignored
+  r.rx.add_rssi_sample(start + 20, 0xF4);        // -12 -> -80 dBm
+  r.rx.add_rssi_sample(start + len - 20, 0x10);  // 16 -> -66 dBm
+  r.tick(len + 5);                               // capture ends after the idle time
+  receive(r.rx, cap);
+  CHECK(rssi0.states.size() == 1 && near(rssi0.states[0], -66.0f));
+  CHECK(r.temp[0].states.size() == 1);
+  CHECK(count_log('D', "battery ok, -66 dBm") == 1);
+
+  // A capture without samples publishes no RSSI but still the other values.
+  r.tick(40000);
+  receive(r.rx, thgr_capture(1, 0x42, 2, 2, 2));
+  CHECK(rssi0.states.size() == 1);
+  CHECK(r.temp[0].states.size() == 2);
+
+  // A remote sensor without an rssi sensor is unaffected by samples.
+  r.tick(40000);
+  r.rx.add_rssi_sample(test_millis() - 30, 0x10);
+  receive(r.rx, thgr_capture(2, 0x11, 1, 5, 3));
+  CHECK(r.temp[1].states.size() == 1);
+  CHECK(rssi0.states.size() == 1);
+}
+
+static void test_rssi_tracker() {
+  RssiTracker t;
+  int16_t dbm = 0;
+  CHECK(!t.peak(0, 1000, dbm));
+  // Across the millis() wrap.
+  t.add(0xFFFFFFF0u, 0xE0);  // -32 -> -90 dBm
+  t.add(0x00000010u, 0xF0);  // -16 -> -82 dBm
+  CHECK(t.peak(0xFFFFFFE0u, 0x00000020u, dbm) && dbm == -82);
+  CHECK(t.peak(0xFFFFFFE0u, 0xFFFFFFF8u, dbm) && dbm == -90);
+  CHECK(!t.peak(0x00000020u, 0x00000100u, dbm));
+  // Rounding of half dB steps away from zero, and the ring buffer keeps the newest.
+  t.clear();
+  t.add(100, 0x01);  // 0.5 - 74 = -73.5 -> -74
+  CHECK(t.peak(0, 200, dbm) && dbm == -74);
+  for (uint32_t i = 0; i < RssiTracker::SAMPLES; i++)
+    t.add(1000 + i, 0x80);  // -128 -> -138 dBm
+  CHECK(!t.peak(0, 200, dbm));
+  CHECK(t.peak(1000, 2000, dbm) && dbm == -138);
+}
+
 int main(int argc, char **argv) {
   test_real_captures(argc > 1 ? argv[1] : "data/rxb6_raw_frames.txt");
   test_repeat_is_ignored();
@@ -295,6 +358,8 @@ int main(int argc, char **argv) {
   test_unknown_type_logging();
   test_rejections_and_counters();
   test_truncated_candidates();
+  test_rssi();
+  test_rssi_tracker();
   std::printf(failures == 0 ? "COMPONENT TESTS PASSED\n" : "%d COMPONENT FAILURES\n", failures);
   return failures == 0 ? 0 : 1;
 }

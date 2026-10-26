@@ -1,0 +1,91 @@
+# Oregon Scientific sensors (THGR122N) via a CC1101 on a WT32-ETH01, with the
+# signal strength (RSSI) of each remote sensor.
+#
+# Wiring CC1101 -> WT32-ETH01
+#   VCC   -> 3V3
+#   GND   -> GND
+#   SCK   -> IO14
+#   MOSI  -> IO15   (SI)
+#   MISO  -> IO35   (SO/GDO1, IO35 is input only)
+#   CSN   -> IO4
+#   GDO2  -> IO36   (RX data, input only)
+
+esphome:
+  name: oregon-v21-receiver-cc1101
+
+esp32:
+  board: wt32-eth01
+  framework:
+    type: esp-idf
+
+ethernet:
+  type: LAN8720
+  mdc_pin: GPIO23
+  mdio_pin: GPIO18
+  clk:
+    pin: GPIO0
+    mode: CLK_EXT_IN
+  phy_addr: 1
+  power_pin: GPIO16
+
+api:
+
+ota:
+  - platform: esphome
+
+logger:
+  level: DEBUG
+
+spi:
+  clk_pin: GPIO14
+  mosi_pin: GPIO15
+  miso_pin: GPIO35
+
+cc1101:
+  id: radio
+  cs_pin: GPIO4
+  frequency: 433.92MHz
+  modulation_type: ASK/OOK
+  filter_bandwidth: 203kHz
+  symbol_rate: 5000
+
+remote_receiver:
+  id: rf_in
+  pin:
+    number: GPIO36
+    # Also watched by oregon_v21_receiver (activity_pin) to time the RSSI reads
+    allow_other_uses: true
+  tolerance: 35%
+  filter: 100us
+  idle: 5ms
+  rmt_symbols: 448
+  receive_symbols: 448
+  filter_symbols: 20
+
+external_components:
+  - source: github://boilerplate4u/oregon_v21_receiver@main
+    components: [oregon_v21_receiver]
+
+oregon_v21_receiver:
+  receiver_id: rf_in
+  # RSSI is read from the CC1101 only while the data pin is high
+  cc1101_id: radio
+  activity_pin:
+    number: GPIO36
+    allow_other_uses: true
+  remote_sensors:
+    - channel: 1
+      temperature:
+        name: "Oregon CH1 Temperature"
+        filters:
+          - timeout: 5min
+      humidity:
+        name: "Oregon CH1 Humidity"
+        filters:
+          - timeout: 5min
+      battery_low:
+        name: "Oregon CH1 Battery Low"
+      rssi:
+        name: "Oregon CH1 RSSI"
+        filters:
+          - timeout: 5min

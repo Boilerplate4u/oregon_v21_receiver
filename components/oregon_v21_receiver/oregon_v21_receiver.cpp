@@ -21,6 +21,21 @@ static const uint32_t UNIT_ID_CONFLICT_WINDOW_MS = 10 * 60 * 1000;
 // Room for MAX_BYTES as "XX " plus the terminator.
 static const size_t HEX_BUFFER_SIZE = ManchesterDecoder::MAX_BYTES * 3 + 1;
 
+// RSSI samples up to this long before the first pulse of a capture still count for it.
+static const uint32_t RSSI_WINDOW_MARGIN_MS = 10;
+
+#ifdef USE_OREGON_V21_RSSI
+// Every SPI access puts a short pulse (about 25 us) on the CC1101 data output, which
+// can break a Manchester bit. RSSI is therefore read in a single access, a few times
+// per frame, and only while the data pin is high, where such a pulse cannot be seen.
+// Same scheme as rf_sniffer 1.1.0 in esphome-cc1101-tools.
+static const uint32_t FRAME_QUIET_US = 5000;           // an edge after this much silence starts a frame
+static const uint32_t FRAME_READ_INTERVAL_US = 10000;  // between reads during one frame, also AGC settle time
+static const uint8_t FRAME_MAX_READS = 4;
+// CC1101 status register RSSI (0x34), read with the burst (0x40) and read (0x80) bits.
+static const uint8_t CC1101_RSSI_STATUS = 0x34 | 0xC0;
+#endif
+
 static void format_hex(const uint8_t *data, size_t len, char *out, size_t out_size) {
   size_t pos = 0;
   out[0] = '\0';
@@ -40,13 +55,15 @@ bool RemoteSensor::matches(const OregonReading &reading) const {
   return true;
 }
 
-void RemoteSensor::publish(const OregonReading &reading) {
+void RemoteSensor::publish(const OregonReading &reading, bool has_rssi, int16_t rssi_dbm) {
   if (this->temperature_sensor_ != nullptr && reading.has_temperature)
     this->temperature_sensor_->publish_state(reading.temperature);
   if (this->humidity_sensor_ != nullptr && reading.has_humidity)
     this->humidity_sensor_->publish_state(reading.humidity);
   if (this->battery_low_binary_sensor_ != nullptr)
     this->battery_low_binary_sensor_->publish_state(reading.battery_low);
+  if (this->rssi_sensor_ != nullptr && has_rssi)
+    this->rssi_sensor_->publish_state(rssi_dbm);
 }
 
 int16_t RemoteSensor::check_unit_id_change(uint8_t unit_id, uint32_t now, uint32_t window_ms) {
@@ -70,9 +87,56 @@ void RemoteSensor::dump_config() const {
   LOG_SENSOR("    ", "Temperature", this->temperature_sensor_);
   LOG_SENSOR("    ", "Humidity", this->humidity_sensor_);
   LOG_BINARY_SENSOR("    ", "Battery low", this->battery_low_binary_sensor_);
+  LOG_SENSOR("    ", "RSSI", this->rssi_sensor_);
 }
 
-void OregonV21Receiver::setup() { this->decoder_.set_record_aborts(true); }
+void OregonV21Receiver::setup() {
+  this->decoder_.set_record_aborts(true);
+#ifdef USE_OREGON_V21_RSSI
+  if (this->radio_ != nullptr && this->activity_pin_ != nullptr) {
+    this->activity_pin_->setup();
+    this->activity_isr_pin_ = this->activity_pin_->to_isr();
+    this->activity_pin_->attach_interrupt(&OregonV21Receiver::gpio_intr_, this, gpio::INTERRUPT_ANY_EDGE);
+  }
+#endif
+}
+
+#ifdef USE_OREGON_V21_RSSI
+void IRAM_ATTR OregonV21Receiver::gpio_intr_(OregonV21Receiver *arg) {
+  const uint32_t now = micros();
+  if (now - arg->last_edge_us_ > FRAME_QUIET_US)
+    arg->frame_started_ = true;
+  arg->last_edge_us_ = now;
+}
+
+void OregonV21Receiver::loop() { this->sample_rssi_(); }
+
+void OregonV21Receiver::sample_rssi_() {
+  if (this->radio_ == nullptr || this->activity_pin_ == nullptr)
+    return;
+  const uint32_t now = micros();
+  if (this->frame_started_) {
+    this->frame_started_ = false;
+    this->frame_reads_ = 0;
+    this->last_rssi_us_ = now;  // first read after FRAME_READ_INTERVAL_US, when the AGC has settled
+    this->high_freq_.start();
+  }
+  if (now - this->last_edge_us_ > FRAME_QUIET_US) {
+    this->high_freq_.stop();
+    return;
+  }
+  if (this->frame_reads_ >= FRAME_MAX_READS || now - this->last_rssi_us_ < FRAME_READ_INTERVAL_US ||
+      !this->activity_isr_pin_.digital_read())
+    return;
+  this->radio_->enable();
+  this->radio_->write_byte(CC1101_RSSI_STATUS);
+  const uint8_t raw = this->radio_->transfer_byte(0);
+  this->radio_->disable();
+  this->rssi_.add(millis(), raw);
+  this->frame_reads_++;
+  this->last_rssi_us_ = now;
+}
+#endif
 
 void OregonV21Receiver::update() {
   if (this->messages_sensor_ != nullptr)
@@ -91,6 +155,13 @@ bool OregonV21Receiver::on_receive(remote_base::RemoteReceiveData data) {
   const auto &raw = data.get_raw_data();
   bool decoded = false;
 
+  // The capture ends now (plus the receiver idle time); it started its total length earlier.
+  uint64_t duration_us = 0;
+  for (int32_t value : raw)
+    duration_us += value < 0 ? uint64_t(-(int64_t) value) : uint64_t(value);
+  const uint32_t capture_end_ms = millis();
+  const uint32_t capture_start_ms = capture_end_ms - uint32_t(duration_us / 1000) - RSSI_WINDOW_MARGIN_MS;
+
   this->decoder_.reset();
   for (int32_t value : raw) {
     // Widths are bounded by the receiver; clamp before negating to avoid INT32_MIN overflow.
@@ -98,12 +169,12 @@ bool OregonV21Receiver::on_receive(remote_base::RemoteReceiveData data) {
     const bool done = this->decoder_.feed(width);
     this->handle_abort_();
     if (done) {
-      decoded |= this->handle_message_();
+      decoded |= this->handle_message_(capture_start_ms, capture_end_ms);
       this->decoder_.reset();
     }
   }
   if (this->decoder_.finish())
-    decoded |= this->handle_message_();
+    decoded |= this->handle_message_(capture_start_ms, capture_end_ms);
   this->handle_abort_();
   this->decoder_.reset();
 
@@ -196,7 +267,7 @@ void OregonV21Receiver::dump_message_verbose_(const char *hex) {
 #endif
 }
 
-bool OregonV21Receiver::handle_message_() {
+bool OregonV21Receiver::handle_message_(uint32_t capture_start_ms, uint32_t capture_end_ms) {
   const uint8_t *data = this->decoder_.data();
   const size_t len = this->decoder_.size();
 
@@ -245,21 +316,28 @@ bool OregonV21Receiver::handle_message_() {
   }
   this->messages_++;
 
+  // Strongest CC1101 sample during this capture; never set without a CC1101.
+  int16_t rssi_dbm = 0;
+  const bool has_rssi = this->rssi_.peak(capture_start_ms, capture_end_ms, rssi_dbm);
+
   ESP_LOGD(TAG, "Message: %s", hex);
+  char rssi_text[16] = "";
+  if (has_rssi)
+    snprintf(rssi_text, sizeof(rssi_text), ", %d dBm", rssi_dbm);
   if (reading.has_humidity) {
-    ESP_LOGD(TAG, "%s type %04X, channel %u, unit_id %02X: %.1f °C, %u %%, battery %s", reading.model, reading.type,
+    ESP_LOGD(TAG, "%s type %04X, channel %u, unit_id %02X: %.1f °C, %u %%, battery %s%s", reading.model, reading.type,
              reading.channel, reading.unit_id, reading.temperature, reading.humidity,
-             reading.battery_low ? "low" : "ok");
+             reading.battery_low ? "low" : "ok", rssi_text);
   } else {
-    ESP_LOGD(TAG, "%s type %04X, channel %u, unit_id %02X: %.1f °C, battery %s", reading.model, reading.type,
-             reading.channel, reading.unit_id, reading.temperature, reading.battery_low ? "low" : "ok");
+    ESP_LOGD(TAG, "%s type %04X, channel %u, unit_id %02X: %.1f °C, battery %s%s", reading.model, reading.type,
+             reading.channel, reading.unit_id, reading.temperature, reading.battery_low ? "low" : "ok", rssi_text);
   }
 
   // Remote sensors with a matching unit_id take precedence over those for the whole channel.
   bool matched = false;
   for (auto *remote_sensor : this->remote_sensors_) {
     if (remote_sensor->has_unit_id() && remote_sensor->matches(reading)) {
-      remote_sensor->publish(reading);
+      remote_sensor->publish(reading, has_rssi, rssi_dbm);
       matched = true;
     }
   }
@@ -275,7 +353,7 @@ bool OregonV21Receiver::handle_message_() {
                    "change.",
                    reading.channel, previous, reading.unit_id, reading.unit_id);
         }
-        remote_sensor->publish(reading);
+        remote_sensor->publish(reading, has_rssi, rssi_dbm);
         matched = true;
       }
     }
@@ -347,6 +425,12 @@ void OregonV21Receiver::dump_config() {
                 " us, preamble %u",
                 t.min_pulse_us, t.max_pulse_us, t.long_pulse_us, t.end_gap_us, t.min_preamble);
   ESP_LOGCONFIG(TAG, "  Verify bit pairs: %s", YESNO(this->verify_bit_pairs_));
+#ifdef USE_OREGON_V21_RSSI
+  if (this->radio_ != nullptr && this->activity_pin_ != nullptr) {
+    ESP_LOGCONFIG(TAG, "  RSSI: CC1101, up to %u reads per frame while the data pin is high", FRAME_MAX_READS);
+    LOG_PIN("  Activity pin: ", this->activity_pin_);
+  }
+#endif
   LOG_UPDATE_INTERVAL(this);
   LOG_SENSOR("  ", "Messages", this->messages_sensor_);
   LOG_SENSOR("  ", "Checksum errors", this->checksum_errors_sensor_);

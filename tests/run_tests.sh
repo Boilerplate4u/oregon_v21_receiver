@@ -20,7 +20,7 @@ FLAGS=(-std=c++17 -O1 -g -Wall -Wextra -Werror -fno-omit-frame-pointer
 "$CXX" "${FLAGS[@]}" fuzz_decoder.cpp "$SRC/manchester_decoder.cpp" "$SRC/oregon_protocol.cpp" -o "$OUT/fuzz_decoder"
 # The ESPHome glue is built against minimal header stubs in tests/stubs.
 "$CXX" "${FLAGS[@]}" -Istubs test_component.cpp "$SRC/oregon_v21_receiver.cpp" "$SRC/manchester_decoder.cpp" \
-  "$SRC/oregon_protocol.cpp" -o "$OUT/test_component"
+  "$SRC/oregon_protocol.cpp" "$SRC/rssi_tracker.cpp" -o "$OUT/test_component"
 
 echo "== unit tests"
 "$OUT/test_decoder" data/rxb6_raw_frames.txt

@@ -2,11 +2,13 @@
 
 Decodes 433.92 MHz Manchester encoded messages from Oregon Scientific sensors
 such as the THGR122N (used with the RAR501 weather station) and publishes
-temperature, humidity and low battery state per configured channel.
+temperature, humidity and low battery state per configured channel. With a
+CC1101 radio it also publishes the signal strength of each remote sensor.
 """
 
 import logging
 
+from esphome import pins
 import esphome.codegen as cg
 from esphome.components import binary_sensor, remote_base, sensor
 import esphome.config_validation as cv
@@ -18,11 +20,13 @@ from esphome.const import (
     CONF_TEMPERATURE,
     DEVICE_CLASS_BATTERY,
     DEVICE_CLASS_HUMIDITY,
+    DEVICE_CLASS_SIGNAL_STRENGTH,
     DEVICE_CLASS_TEMPERATURE,
     ENTITY_CATEGORY_DIAGNOSTIC,
     STATE_CLASS_MEASUREMENT,
     STATE_CLASS_TOTAL_INCREASING,
     UNIT_CELSIUS,
+    UNIT_DECIBEL_MILLIWATT,
     UNIT_PERCENT,
 )
 import esphome.final_validate as fv
@@ -41,6 +45,9 @@ CONF_UNIT_ID = "unit_id"
 CONF_LEGACY_DEVICES = "devices"
 CONF_LEGACY_ROLLING_CODE = "rolling_code"
 CONF_BATTERY_LOW = "battery_low"
+CONF_RSSI = "rssi"
+CONF_CC1101_ID = "cc1101_id"
+CONF_ACTIVITY_PIN = "activity_pin"
 CONF_TIMING = "timing"
 CONF_MIN_PULSE = "min_pulse"
 CONF_LONG_PULSE = "long_pulse"
@@ -74,6 +81,8 @@ OregonV21Receiver = oregon_ns.class_(
 )
 RemoteSensor = oregon_ns.class_("RemoteSensor")
 ManchesterTiming = oregon_ns.namespace("ManchesterDecoder").struct("Timing")
+# Declared here instead of imported, so the component still loads without cc1101.
+CC1101Component = cg.esphome_ns.namespace("cc1101").class_("CC1101Component")
 
 
 def _migrate_legacy_config(config):
@@ -142,6 +151,22 @@ def _validate_remote_sensors(config):
     return config
 
 
+def _validate_rssi(config):
+    """RSSI needs the CC1101 and its data pin; one without the other is a mistake."""
+    if (CONF_CC1101_ID in config) != (CONF_ACTIVITY_PIN in config):
+        raise cv.Invalid(
+            f"'{CONF_CC1101_ID}' and '{CONF_ACTIVITY_PIN}' must be set together"
+        )
+    if CONF_CC1101_ID not in config:
+        for remote_sensor in config.get(CONF_REMOTE_SENSORS, []):
+            if CONF_RSSI in remote_sensor:
+                raise cv.Invalid(
+                    f"'{CONF_RSSI}' requires '{CONF_CC1101_ID}' and '{CONF_ACTIVITY_PIN}' "
+                    "(signal strength is read from a CC1101)"
+                )
+    return config
+
+
 def _validate_timing(config):
     if not (
         config[CONF_MIN_PULSE]
@@ -178,9 +203,18 @@ REMOTE_SENSOR_SCHEMA = cv.All(
                 device_class=DEVICE_CLASS_BATTERY,
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             ),
+            cv.Optional(CONF_RSSI): sensor.sensor_schema(
+                unit_of_measurement=UNIT_DECIBEL_MILLIWATT,
+                accuracy_decimals=0,
+                device_class=DEVICE_CLASS_SIGNAL_STRENGTH,
+                state_class=STATE_CLASS_MEASUREMENT,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
         }
     ),
-    cv.has_at_least_one_key(CONF_TEMPERATURE, CONF_HUMIDITY, CONF_BATTERY_LOW),
+    cv.has_at_least_one_key(
+        CONF_TEMPERATURE, CONF_HUMIDITY, CONF_BATTERY_LOW, CONF_RSSI
+    ),
 )
 
 TIMING_SCHEMA = cv.All(
@@ -228,9 +262,15 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_TIMING, default={}): TIMING_SCHEMA,
             cv.Optional(CONF_VERIFY_BIT_PAIRS, default=True): cv.boolean,
             cv.Optional(CONF_DIAGNOSTICS, default={}): DIAGNOSTICS_SCHEMA,
+            # CC1101 that receives the messages, for the signal strength (rssi).
+            cv.Optional(CONF_CC1101_ID): cv.use_id(CC1101Component),
+            # The receiver data pin (CC1101 GDO2, same pin as remote_receiver). RSSI
+            # is read only while it is high, where the read cannot disturb the data.
+            cv.Optional(CONF_ACTIVITY_PIN): pins.internal_gpio_input_pin_schema,
         }
     ).extend(cv.polling_component_schema("60s")),
     _validate_remote_sensors,
+    _validate_rssi,
 )
 
 
@@ -296,6 +336,13 @@ async def to_code(config):
 
     cg.add(var.set_verify_bit_pairs(config[CONF_VERIFY_BIT_PAIRS]))
 
+    if CONF_CC1101_ID in config:
+        cg.add_define("USE_OREGON_V21_RSSI")
+        radio = await cg.get_variable(config[CONF_CC1101_ID])
+        cg.add(var.set_radio(radio))
+        pin = await cg.gpio_pin_expression(config[CONF_ACTIVITY_PIN])
+        cg.add(var.set_activity_pin(pin))
+
     for key in DIAGNOSTIC_KEYS:
         if key in config[CONF_DIAGNOSTICS]:
             sens = await sensor.new_sensor(config[CONF_DIAGNOSTICS][key])
@@ -315,4 +362,7 @@ async def to_code(config):
         if CONF_BATTERY_LOW in rs_config:
             bsens = await binary_sensor.new_binary_sensor(rs_config[CONF_BATTERY_LOW])
             cg.add(remote_sensor.set_battery_low_binary_sensor(bsens))
+        if CONF_RSSI in rs_config:
+            sens = await sensor.new_sensor(rs_config[CONF_RSSI])
+            cg.add(remote_sensor.set_rssi_sensor(sens))
         cg.add(var.add_remote_sensor(remote_sensor))

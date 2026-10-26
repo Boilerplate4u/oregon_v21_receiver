@@ -7,6 +7,7 @@ ESPHome external component that decodes **Oregon Scientific v2.1** 433.92 MHz se
 stream of a standard `remote_receiver`, such as an RXB6 superheterodyne receiver on an ESP32.
 
 Temperature, humidity and low battery state are published to Home Assistant per channel.
+With a CC1101 radio the signal strength (RSSI) of each remote sensor is published too.
 
 ## How it works
 
@@ -115,6 +116,9 @@ A complete example, including the diagnostic counters, is in
 | `remote_sensors[].temperature` | Sensor, temperature measured by the remote sensor in °C. All sensor options (filters etc.) are available. |
 | `remote_sensors[].humidity` | Sensor, relative humidity measured by the remote sensor in %. |
 | `remote_sensors[].battery_low` | Binary sensor, on when the remote sensor reports low battery. |
+| `remote_sensors[].rssi` | Sensor, signal strength in dBm of the remote sensor's last message, measured by the CC1101. Requires `cc1101_id` and `activity_pin`. |
+| `cc1101_id` | Optional ID of the `cc1101` radio that feeds the `remote_receiver`. Needed for `rssi`. |
+| `activity_pin` | The receiver data pin (CC1101 GDO2, the same pin as `remote_receiver`, with `allow_other_uses: true` in both places). Set together with `cc1101_id`. |
 | `verify_bit_pairs` | Default `true`. Reject messages where a bit and its complement are equal. Set to `false` only if valid messages are rejected; the errors are then still logged. |
 | `diagnostics` | Optional counters since boot: `messages`, `checksum_errors`, `bit_pair_errors`, `rejected` and `aborted`. Each takes sensor options such as `name`. |
 | `update_interval` | How often the diagnostic counters are published. Default `60s`. |
@@ -142,6 +146,40 @@ single outlier at the cost of reporting the middle of the last three values:
               send_every: 1
           - timeout: 5min
 ```
+
+### Signal strength (CC1101)
+
+With a CC1101 the component reads the RSSI register a few times while a message is
+received and publishes the strongest value with the message. Each SPI access puts a
+short pulse (about 25 us) on the CC1101 data output, which can break a Manchester bit,
+so the register is read in a single access, at most 4 times per frame, 10 ms apart, and
+only while the data pin is high, where such a pulse cannot be seen. The pin is watched
+with an interrupt on `activity_pin`. This is the scheme of `rf_sniffer` 1.1.0 in
+[esphome-cc1101-tools](https://github.com/boilerplate4u/esphome-cc1101-tools), where
+reading every millisecond was found to disturb reception.
+
+```yaml
+remote_receiver:
+  id: rf_in
+  pin:
+    number: GPIO36      # CC1101 GDO2
+    allow_other_uses: true
+
+oregon_v21_receiver:
+  receiver_id: rf_in
+  cc1101_id: radio
+  activity_pin:
+    number: GPIO36
+    allow_other_uses: true
+  remote_sensors:
+    - channel: 1
+      rssi:
+        name: "Oregon CH1 RSSI"
+```
+
+A complete example for a WT32-ETH01 is in
+[`example/oregon-v21-receiver-cc1101.yaml`](example/oregon-v21-receiver-cc1101.yaml).
+The value is also added to the DEBUG line of each reading (`..., battery ok, -72 dBm`).
 
 ### Diagnostic counters
 
@@ -245,7 +283,7 @@ uses it when available and falls back to `register_listener` on older versions.
 (Debian/WSL, Linux or macOS):
 
 * `test_component` runs the ESPHome glue (remote sensor matching, repeats, warnings,
-  counters, unknown types, VERBOSE dump) against minimal ESPHome header stubs in `tests/stubs`, with the same
+  counters, unknown types, VERBOSE dump, RSSI per message) against minimal ESPHome header stubs in `tests/stubs`, with the same
   captures. The real ESPHome API is covered by the compile in GitHub Actions.
 * `test_decoder` covers the parser and decoder with real pulse captures from an RXB6
   (`tests/data/rxb6_raw_frames.txt`) and synthetic messages (negative temperature, low
@@ -259,7 +297,7 @@ tests/run_tests.sh        # a few seconds
 tests/run_tests.sh 10     # ten times more fuzz iterations
 ```
 
-GitHub Actions runs the tests and compiles the example for ESP32 with ESPHome 2026.9.1,
+GitHub Actions runs the tests and compiles both examples (RXB6 and CC1101 with RSSI) for ESP32 with ESPHome 2026.9.1,
 the latest release and the dev branch on every push and pull request
 ([`.github/workflows/tests.yml`](.github/workflows/tests.yml)).
 

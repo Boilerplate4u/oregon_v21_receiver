@@ -55,9 +55,14 @@ jobs:
           sed "s#source: github://boilerplate4u/oregon_v21_receiver@main#source:\n      type: local\n      path: ../components#" \
             example/oregon-v21-receiver.yaml > ci/oregon.yaml
           grep -q "type: local" ci/oregon.yaml
+          sed "s#source: github://boilerplate4u/oregon_v21_receiver@main#source:\n      type: local\n      path: ../components#" \
+            example/oregon-v21-receiver-cc1101.yaml > ci/oregon-cc1101.yaml
+          grep -q "type: local" ci/oregon-cc1101.yaml
           printf 'wifi_ssid: "ci"\nwifi_password: "ci-password"\n' > ci/secrets.yaml
       - name: Validate config
-        run: esphome config ci/oregon.yaml
+        run: |
+          esphome config ci/oregon.yaml
+          esphome config ci/oregon-cc1101.yaml
       - name: Validate deprecated names (devices, rolling_code)
         run: |
           sed -e "s/^  remote_sensors:/  devices:/" -e "s/^    - channel: 1$/    - channel: 1\n      rolling_code: 0x7B/" \
@@ -68,3 +73,5 @@ jobs:
           grep -q "'rolling_code' is deprecated" ci/legacy.log
       - name: Compile
         run: esphome compile ci/oregon.yaml
+      - name: Compile CC1101 example with RSSI
+        run: esphome compile ci/oregon-cc1101.yaml
